@@ -1,0 +1,174 @@
+---
+title: "BMACS Analysis"
+author: "Minho Shin"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r library, message=FALSE}
+# start by loading libraries
+library(here)
+library(tidyverse)
+library(INLA)
+library(gifti)
+```
+
+set INLA options
+
+```{r inla_options}
+# limit maximum number of threads
+inla.setOption("num.threads", "8")
+inla.setOption(pardiso.license = "~/pardiso.lic")
+inla.setOption(mkl = TRUE) 
+```
+
+## Run INLA
+
+### load preprocessed data
+
+```{r load_data}
+# load data
+coords <- read_csv(here("data","data_coords_preprocessed.csv")) %>% 
+  mutate(norm_x = sx / sqrt(sx^2+sy^2+sz^2),
+         norm_y = sy / sqrt(sx^2+sy^2+sz^2),
+         norm_z = sz / sqrt(sx^2+sy^2+sz^2))
+coords
+```
+```{r process_data}
+data <- coords %>% 
+  group_by(Paper, inference) %>% 
+  nest() %>%
+  ungroup() %>% 
+  mutate(Paper = row_number()) %>% 
+  unnest(cols = data) %>%
+  group_by(Paper, inference, hemisphere) %>% 
+  nest() %>%
+  ungroup() %>% 
+  mutate(index = row_number())
+```
+
+### create mesh
+
+```{r create_mesh}
+# build mesh and spde
+mesh <- inla.mesh.create(globe = 25)
+spde <- inla.spde2.matern(mesh)
+
+# build stack in a loop
+nv <- mesh$n # number of vertices
+iw <- inla.mesh.fem(mesh, order = 2)$va
+imat <- Diagonal(nv, rep(1, nv))
+```
+
+### build stack for each index
+
+```{r build_stacks}
+# row-wise iteration
+t0 <- Sys.time()
+stack.list <- data %>%
+  pmap(function(...) {
+    df <- list(...)
+
+    loc <- as.matrix(df$data[c("norm_x", "norm_y", "norm_z")])
+    n <- nrow(loc)
+
+    y.pp <- rep(0:1, c(nv, n))
+    e.pp <- c(iw, rep(0, n))
+    lmat <- inla.spde.make.A(mesh = mesh, loc = loc)
+    A.pp <- rbind(imat, lmat)
+
+    if (df$inference == 1 & df$hemisphere == "left") {
+      effects <- list(
+        list(sf.iL = seq_len(spde$n.spde)),
+        list(
+          intercept.iL = rep(1, length(y.pp)),
+          paper = rep(df$Paper, length(y.pp))
+        )
+      )
+    } else if (df$inference == 1 & df$hemisphere == "right") {
+      effects <- list(
+        list(sf.iR = seq_len(spde$n.spde)),
+        list(
+          intercept.iR = rep(1, length(y.pp)),
+          paper = rep(df$Paper, length(y.pp))
+        )
+      )
+    } else if (df$inference == 2 & df$hemisphere == "left") {
+      effects <- list(
+        list(sf.dL = seq_len(spde$n.spde)),
+        list(
+          intercept.dL = rep(1, length(y.pp)),
+          paper = rep(df$Paper, length(y.pp))
+        )
+      )
+    } else if (df$inference == 2 & df$hemisphere == "right") {
+      effects <- list(
+        list(sf.dR = seq_len(spde$n.spde)),
+        list(
+          intercept.dR = rep(1, length(y.pp)),
+          paper = rep(df$Paper, length(y.pp))
+        )
+      )
+    }
+    return(inla.stack(
+      data = list(y = y.pp, e = e.pp),
+      A = list(A.pp, 1),
+      effects = effects
+    ))
+  })
+t1 <- Sys.time()
+print(t1 - t0)
+```
+
+### merge all the stacks together
+
+```{r merge_stacks}
+stk.pp.joint <- do.call(inla.stack, stack.list)
+```
+
+### set formula for log-Gaussian Processes
+
+```{r formula}
+form <- y ~ 0 + intercept.iL + intercept.iR + intercept.dL + intercept.dR +
+  f(sf.iL, model=spde) + f(sf.iR, model=spde) + 
+  f(sf.dL, model=spde) + f(sf.dR, model=spde) + 
+  f(paper, model = "iid") 
+```
+
+
+### Run INLA
+
+```{r run_inla}
+t2 <- Sys.time()
+pp.inla <- inla(form,
+  family = "poisson", data = inla.stack.data(stk.pp.joint),
+  control.predictor = list(
+    A = inla.stack.A(stk.pp.joint),
+    compute = TRUE
+  ),
+  E = inla.stack.data(stk.pp.joint)$e,
+  control.compute = list(
+    dic = TRUE, cpo = TRUE, waic = TRUE, config = TRUE
+  ),
+  control.inla = list(int.strategy = "eb"),
+  verbose = TRUE
+)
+t3 <- Sys.time()
+print(t3 - t2)
+
+# save result file
+saveRDS(pp.inla, file = here("output", "BMACS_results.rds"))
+
+# save posterior means of the parameters for simulation
+post.means <- pp.inla[c("summary.fixed", "summary.random", "summary.hyperpar")]
+saveRDS(post.means, here("output", "posterior_means.rds"))
+```
+
+## System Information
+
+```{r sys_info}
+sessionInfo()
+```

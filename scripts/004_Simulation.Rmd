@@ -1,0 +1,306 @@
+---
+title: "Simulation"
+author: "Minho Shin"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r library, message=FALSE}
+# load library for simulation
+library(here)
+library(INLA)
+library(inlabru)
+library(tidyverse)
+```
+
+```{r inla_setup}
+# limit maximum number of threads
+inla.setOption("num.threads", "8")
+inla.setOption(pardiso.license = "~/pardiso.lic")
+inla.setOption(mkl = FALSE)
+set.seed(1234)
+```
+
+
+## Generate simulation data
+
+We use estimated parameters to generate simulation.
+
+```{r generate_simul_input, warning=FALSE}
+# load estimated result
+input <- read_csv(here("data", "data_coords_preprocessed.csv")) %>%
+  group_by(Paper, inference) %>%
+  nest() %>%
+  ungroup() %>%
+  mutate(Paper = row_number()) %>%
+  unnest(cols = data) %>%
+  group_by(Paper, inference, hemisphere) %>%
+  nest() %>%
+  ungroup() %>%
+  mutate(
+    row_num = row_number(),
+    index = case_when(
+      inference == 1 & hemisphere == "left" ~ 1,
+      inference == 1 & hemisphere == "right" ~ 2,
+      inference == 2 & hemisphere == "left" ~ 3,
+      inference == 2 & hemisphere == "right" ~ 4,
+    )
+  )
+
+post.means <- readRDS(here("output", "posterior_means.rds")) # readRDS("~/Downloads/posterior_means.rds")
+
+# build mesh and spde
+mesh <- inla.mesh.create(globe = 25)
+spde <- inla.spde2.matern(mesh)
+
+# modelling intensity
+# pre_range_params <- post.means$summary.hyperpar$mean[c(2, 4, 6, 8)]
+# range_params <- sqrt(8) / exp(pre_range_params)
+
+random_effects <- map(1:4, function(x) {
+  theta <- post.means$summary.hyperpar$mean[c(2 * x - 1, 2 * x)]
+  prec <- inla.spde.precision(spde, theta = theta)
+  sample <- inla.qsample(1, prec, seed = 1234L)[, 1]
+  return(sample)
+})
+
+data <- input %>%
+  mutate(loglambdas = pmap(., function(Paper, index, ...) {
+    intercept <- post.means$summary.fixed$mean[index]
+    random <- random_effects[[index]]
+    paper <- post.means$summary.random$paper$mean[Paper]
+    loglambda <- intercept + random + paper
+    return(loglambda)
+  }))
+
+# generate
+data <- data %>%
+  mutate(points = pmap(., function(loglambdas, ...) {
+    loglambda <- unlist(loglambdas)
+    points <- inlabru::sample.lgcp(mesh, loglambda, strategy = 'spherical', R = 1)
+    return(as_tibble(points@coords))
+  }))
+
+sim_input <- data %>%
+  select(-loglambdas, -data) %>%
+  unnest(cols = points) %>%
+  select(-c(coords.x1:coords.x3))
+
+# save generated points
+saveRDS(sim_input, here("data", "simulation_input2.rds"))
+```
+
+## Fit INLA to the simulated data
+
+### set data
+
+```{r set_input}
+sim_input <- readRDS(here("data", "simulation_input.rds"))
+
+data <- sim_input %>%
+  group_by(Paper, inference) %>%
+  nest() %>%
+  ungroup() %>%
+  mutate(Paper = row_number()) %>%
+  unnest(cols = data) %>%
+  group_by(Paper, inference, hemisphere) %>%
+  nest() %>%
+  ungroup() %>%
+  mutate(index = row_number())
+```
+
+### create mesh
+
+```{r create_mesh}
+# build mesh and spde
+mesh <- inla.mesh.create(globe = 25)
+spde <- inla.spde2.matern(mesh)
+
+# build stack in a loop
+nv <- mesh$n # number of vertices
+iw <- inla.mesh.fem(mesh, order = 2)$va
+imat <- Diagonal(nv, rep(1, nv))
+```
+
+### build stack for each index
+
+```{r build_stacks}
+# row-wise iteration
+t0 <- Sys.time()
+stack.list <- data %>%
+  pmap(function(...) {
+    df <- list(...)
+
+    loc <- as.matrix(df$data[c("x", "y", "z")])
+    n <- nrow(loc)
+
+    y.pp <- rep(0:1, c(nv, n))
+    e.pp <- c(iw, rep(0, n))
+    lmat <- inla.spde.make.A(mesh = mesh, loc = loc)
+    A.pp <- rbind(imat, lmat)
+
+    if (df$inference == 1 & df$hemisphere == "left") {
+      effects <- list(
+        list(sf.iL = seq_len(spde$n.spde)),
+        list(
+          intercept.iL = rep(1, length(y.pp)),
+          paper = rep(df$Paper, length(y.pp))
+        )
+      )
+    } else if (df$inference == 1 & df$hemisphere == "right") {
+      effects <- list(
+        list(sf.iR = seq_len(spde$n.spde)),
+        list(
+          intercept.iR = rep(1, length(y.pp)),
+          paper = rep(df$Paper, length(y.pp))
+        )
+      )
+    } else if (df$inference == 2 & df$hemisphere == "left") {
+      effects <- list(
+        list(sf.dL = seq_len(spde$n.spde)),
+        list(
+          intercept.dL = rep(1, length(y.pp)),
+          paper = rep(df$Paper, length(y.pp))
+        )
+      )
+    } else if (df$inference == 2 & df$hemisphere == "right") {
+      effects <- list(
+        list(sf.dR = seq_len(spde$n.spde)),
+        list(
+          intercept.dR = rep(1, length(y.pp)),
+          paper = rep(df$Paper, length(y.pp))
+        )
+      )
+    }
+    return(inla.stack(
+      data = list(y = y.pp, e = e.pp),
+      A = list(A.pp, 1),
+      effects = effects
+    ))
+  })
+t1 <- Sys.time()
+print(t1 - t0)
+```
+
+### merge all the stacks together
+
+```{r merge_stacks}
+stk.pp.joint <- do.call(inla.stack, stack.list)
+```
+
+### set formula for log-Gaussian Processes
+
+```{r formula}
+form <- y ~ 0 + intercept.iL + intercept.iR + intercept.dL + intercept.dR +
+  f(sf.iL, model = spde) + f(sf.iR, model = spde) +
+  f(sf.dL, model = spde) + f(sf.dR, model = spde) +
+  f(paper, model = "iid")
+```
+
+
+### Run INLA
+
+```{r run_inla}
+t2 <- Sys.time()
+pp.inla <- inla(form,
+  family = "poisson", data = inla.stack.data(stk.pp.joint),
+  control.predictor = list(
+    A = inla.stack.A(stk.pp.joint),
+    compute = TRUE
+  ),
+  E = inla.stack.data(stk.pp.joint)$e,
+  control.compute = list(
+    dic = TRUE, cpo = TRUE, waic = TRUE, config = TRUE
+  ),
+  control.inla = list(int.strategy = "eb"),
+  verbose = TRUE
+)
+t3 <- Sys.time()
+print(t3 - t2)
+
+# save result file
+saveRDS(pp.inla, file = here("output", "BMACS_results_simulation.rds"))
+```
+
+## Plot figure 5
+
+```{r fig5, fig.width=3.5, fig.height=3.5}
+# load estimated result
+res <- readRDS(here("output", "BMACS_results_simulation.rds"))
+
+# true value
+post.means <- readRDS(here("output", "posterior_means.rds"))
+true_value <- c(post.means$summary.fixed$mean, post.means$summary.hyperpar$mean)
+
+# transform parameters
+true_transformed <- true_value
+# range
+true_transformed[c(6, 8, 10, 12)] <- sqrt(8) / exp(true_value[c(6, 8, 10, 12)])
+# variance
+true_transformed[c(5, 7, 9, 11)] <- 1 / (4 * pi * exp(true_value[c(6, 8, 10, 12)])^2 * exp(true_value[c(5, 7, 9, 11)])^2)
+# paper specific random effects
+true_transformed[13] <- 1 / exp(true_value[13])
+
+
+spatial_marginals <- map(c("sf.iL", "sf.iR", "sf.dL", "sf.dR"), function(x) {
+  components <- c("marginals.variance.nominal", "marginals.range.nominal")
+  transformed_result <- inla.spde.result(res, x, spde)[components] %>%
+    flatten() %>%
+    set_names(paste(c("variance", "range"), "for", x))
+}) %>%
+  flatten()
+
+var_papers <- inla.tmarginal(function(x) 1 / exp(x), res$marginals.hyperpar$`Precision for paper`) %>%
+  list() %>%
+  set_names("variance for paper")
+
+marginal_list <- append(res$marginals.fixed, append(spatial_marginals, var_papers))
+margs <- marginal_list %>%
+  map_dfr(function(x) {
+    hpds <- inla.hpdmarginal(0.95, x)
+    emean <- inla.emarginal(function(em) em, x)
+    res <- tibble(low = hpds[1], high = hpds[2], mean = emean)
+  },
+  .id = "param"
+  )
+
+margs <- mutate(margs, param = str_replace(param, " for ", "."))
+
+margs$true_value <- true_transformed
+
+ubound <- max(margs$high)*1.1
+lbound <- min(margs$low)*1.1
+
+color_set <- c("True" = "red", "Estimated" = "black")
+fig.margs <- ggplot(margs) +
+  geom_hline(yintercept = 0, colour = "#b2b2b2", size = 0.7, linetype = "dashed") +
+  geom_linerange(aes(x = fct_rev(fct_inorder(param)), ymin = low, ymax = high, colour = "Estimated"), size = 1) +
+  geom_point(aes(x = fct_rev(fct_inorder(param)), y = true_value, colour = "True"), size = 2) +
+  scale_colour_manual(name = "", values = color_set) +
+  guides(color = guide_legend(override.aes = list(shape = 15, size = 5))) +
+  cowplot::theme_cowplot() + 
+  theme(
+    legend.key = element_rect(fill = NA),
+    legend.key.size = unit(1, 'mm'),
+    legend.text = element_text(size = 8),
+    legend.position = c(.65, .95),
+    axis.text.x = element_text(size = 7),
+    axis.text.y = element_text(size = 7, angle = 45),
+    axis.title = element_text(size = 8),
+    plot.margin = margin(t = 7, r = 7, b = 7, l = -10)
+  ) +
+  lemon::coord_capped_flip(ylim = c(lbound, ubound)) +
+  labs(x = "", y = "Highest Density Interval")
+
+fig.margs
+# ggsave(here("output", "figure5.pdf"), fig.margs, width = 86, height = 86, units = "mm")
+```
+
+## System Information
+
+```{r sys_info}
+sessionInfo()
+```

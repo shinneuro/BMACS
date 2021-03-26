@@ -1,0 +1,360 @@
+---
+title: "Result Analysis"
+author: "Minho Shin"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r library, message=FALSE}
+# start by loading libraries
+library(here)
+library(tidyverse)
+library(INLA)
+library(gifti)
+library(ciftiTools)
+library(rgl)
+```
+
+```{r paths, results=FALSE, message=FALSE}
+# custom functions
+source_files <- list.files(here("R"), full.names = TRUE)
+lapply(source_files, source)
+# wb_command path
+sysname <- Sys.info()['sysname']
+if (sysname == 'Linux') {
+  wb_command <- '/usr/local/workbench/bin_linux64/wb_command'
+} else if (sysname == 'Darwin') {
+  wb_command <- '/Applications/workbench/bin_macosx64/wb_command'
+}
+# ciftiTools options
+ciftiTools::ciftiTools.setOption('wb_path', wb_command)
+rgl::setupKnitr()
+```
+
+### Download surface meshes
+
+```{r download_meshes}
+mesh_file_url <- 'http://brainvis.wustl.edu/workbench/standard_mesh_atlases_8may2017.zip'
+destfile <- here('external', 'standard_mesh_atlases_8may2017.zip')
+download.file(mesh_file_url, destfile)
+unzip(destfile, exdir = here('external'))
+```
+
+### Load data
+
+```{r load_data}
+# load data
+coords <- read_csv(here("data","data_coords_preprocessed.csv")) %>% 
+  mutate(norm_x = sx / sqrt(sx^2+sy^2+sz^2),
+         norm_y = sy / sqrt(sx^2+sy^2+sz^2),
+         norm_z = sz / sqrt(sx^2+sy^2+sz^2))
+
+# manipulate data
+data <- coords %>% 
+  group_by(Paper, inference) %>% 
+  nest() %>%
+  ungroup() %>% 
+  mutate(Paper = row_number()) %>% 
+  unnest(cols = data) %>%
+  group_by(Paper, inference, hemisphere) %>% 
+  nest() %>%
+  ungroup() %>% 
+  mutate(
+    row_num = row_number(),
+    index = case_when(
+      inference == 1 & hemisphere == "left" ~ 1,
+      inference == 1 & hemisphere == "right" ~ 2,
+      inference == 2 & hemisphere == "left" ~ 3,
+      inference == 2 & hemisphere == "right" ~ 4,
+    )
+  )
+```
+
+### build fsaverage meshes
+
+```{r build_mesh}
+# build mesh and spde
+mesh <- inla.mesh.create(globe = 25)
+iw <- inla.mesh.fem(mesh, order = 2)$va
+# I have fsaverage vertice data
+sp.L <- read_gifti(here(
+  "external", "standard_mesh_atlases", "resample_fsaverage", 
+  "fsaverage_std_sphere.L.164k_fsavg_L.surf.gii"
+))[["data"]][["pointset"]] %>%
+  (function(x) x / sqrt(rowSums(x^2))) %>%
+  sp::SpatialPoints()
+sp.R <- read_gifti(here(
+  "external", "standard_mesh_atlases", "resample_fsaverage", 
+  "fsaverage_std_sphere.R.164k_fsavg_R.surf.gii"
+))[["data"]][["pointset"]] %>%
+  (function(x) x / sqrt(rowSums(x^2))) %>%
+  sp::SpatialPoints()
+
+A.L <- inla.spde.make.A(mesh, sp.L)
+A.R <- inla.spde.make.A(mesh, sp.R)
+As <- list(A.L, A.R, A.L, A.R)
+```
+
+## Calculate mean and posterior lambdas 
+
+### load INLA result
+
+```{r load_posterior}
+# load fitted posterior
+# ~ 4GB RAM needed
+res1 <- readRDS(here("output", "BMACS_results.rds"))
+```
+
+### sample posterior
+
+```{r sample_posterior}
+# sample from posterior
+n.samples <- 1000
+inla.seed <- 0L
+
+set.seed(inla.seed)
+samples <- inla.posterior.sample(n = n.samples, result = res1, seed = inla.seed,
+                                 selection = list(intercept.iL = 0, intercept.iR = 0,
+                                                  intercept.dL = 0, intercept.dR = 0,
+                                                  sf.iL = 0, sf.iR = 0, sf.dL = 0, sf.dR = 0, paper = 0))
+```
+
+
+```{r remove_fitted_params}
+# remove fitted posterior after saving some parameters
+param_list <- append(list(intercepts = res1$summary.fixed), res1$summary.random)
+
+intercepts <- param_list[[1]]$mean
+sps <- map_dfc(2:5, ~ param_list[[.]]$mean)
+papers <- param_list[[6]]$mean
+
+rm(res1); gc()
+```
+
+## calculate post lambdas
+
+```{r lambdas}
+post_lambdas <- map(seq_len(n.samples), function(n) {
+  
+  smpl.latent <- samples[[n]]$latent
+  categories <- c("iL", "iR", "dL", "dR")
+  int_names <- paste0("intercept.", categories)
+  sp_names <-paste0("sf.", categories)
+  
+  intercepts <- int_names %>% map(~ smpl.latent[startsWith(rownames(smpl.latent), .), ])
+  sps <- sp_names %>% map(~ smpl.latent[startsWith(rownames(smpl.latent), .), ])
+  spatial <- map2(As, sps, ~ as.vector(.x %*% .y))
+  # return result
+  result <- map2(intercepts, spatial, ~ exp(.x + .y)) %>%
+    set_names(paste0("lambdas_", categories))
+}) %>% 
+  transpose() 
+```
+
+## Reasoning-Specific maps
+
+### Calculate Exceedance Map
+
+```{r exceedance_map}
+# sum if lambdas over 1 
+post_exceedance <- post_lambdas %>% 
+  map(bind_cols) %>% 
+  map(~ {rowSums(as.matrix(.) > 1) / n.samples}) %>% 
+  bind_cols() 
+
+rm(post_lambdas); gc()
+```
+
+### Resampling fsaverage map to fs_LR for visualization
+
+```{r resampling}
+# resample fsaverage to fs_LR 32k meshes
+name_prefix <- "lambdas_exceedance_map"
+template_path <- here::here("external", "standard_mesh_atlases", "resample_fsaverage")
+
+post_exceedance %>%
+  purrr::iwalk(function(data, name) {
+    filename <- glue::glue('{name_prefix}.{name}')
+    hemisphere <- stringr::str_sub(name, -1)
+    resample_fsavg_to_fslr(data, filename, hemisphere, template_path, wb_command)
+  })
+```
+
+### Visualization
+
+```{r ciftitools}
+# construct xifti for visualization
+lh_surf <- ciftiTools::demo_files()$surf["left"]
+rh_surf <- ciftiTools::demo_files()$surf["right"]
+
+lh_induction <- gifti::read_gifti(here("output", "lambdas_exceedance_map.lambdas_iL.L.32k_fs_LR.func.gii"))$data$normal
+rh_induction <- gifti::read_gifti(here("output", "lambdas_exceedance_map.lambdas_iR.R.32k_fs_LR.func.gii"))$data$normal
+
+lh_deduction <- gifti::read_gifti(here("output", "lambdas_exceedance_map.lambdas_dL.L.32k_fs_LR.func.gii"))$data$normal
+rh_deduction <- gifti::read_gifti(here("output", "lambdas_exceedance_map.lambdas_dR.R.32k_fs_LR.func.gii"))$data$normal
+
+cii_induction <- ciftiTools::as.xifti(
+  cortexL = lh_induction,
+  cortexR = rh_induction
+) %>%
+  ciftiTools::add_surf(surfL = lh_surf, surfR = rh_surf)
+
+cii_deduction <- ciftiTools::as.xifti(
+  cortexL = lh_deduction,
+  cortexR = rh_deduction
+) %>%
+  ciftiTools::add_surf(surfL = lh_surf, surfR = rh_surf)
+
+```
+
+```{r induction_map, rgl=TRUE, format="png", fig.height=6, fig.width=8}
+view_xifti_surface(cii_induction, zlim = c(0, 1), widget = FALSE, title = "Induction Specific Map")
+```
+
+```{r deduction_map, rgl=TRUE, format="png", fig.height=6, fig.width=8}
+view_xifti_surface(cii_deduction, zlim = c(0, 1), widget = FALSE, title = "Deduction Specific Map")
+```
+
+
+### Save Exceedance Maps
+
+```{r save_exceedance_map}
+# set labels
+bmacs_labels <- read.table(file = here("data", "label_df.txt"), row.names = 1)
+bmacs_labels
+
+cii_induction <- ciftiTools::as.xifti(
+  cortexL = (lh_induction >= 0.95) * 1,
+  cortexR = (rh_induction >= 0.95) * 1
+)
+
+cii_deduction <- ciftiTools::as.xifti(
+  cortexL = (lh_deduction >= 0.95) * 3,
+  cortexR = (rh_deduction >= 0.95) * 3 
+)
+
+cii_conjunction <- ciftiTools::as.xifti(
+  cortexL = (lh_induction >= 0.95) * (lh_deduction >= 0.95) * 2,
+  cortexR = (lh_deduction >= 0.95) * (rh_deduction >= 0.95) * 2
+)
+
+# save result
+cii_induction$meta$cifti$names <- "Inductive Reasoning"
+cii_deduction$meta$cifti$names <- "Deductive Reasoning"
+cii_conjunction$meta$cifti$names <- "Conjunction"
+
+# labeling
+# INTENT_3007: label cifti file (*.dlabel.nii)
+cii_induction$meta$cifti$intent <- 3007
+cii_deduction$meta$cifti$intent <- 3007
+cii_conjunction$meta$cifti$intent <- 3007
+
+cii_induction$meta$cifti$labels[[1]] <- bmacs_labels
+cii_deduction$meta$cifti$labels[[1]] <- bmacs_labels
+cii_conjunction$meta$cifti$labels[[1]] <- bmacs_labels
+
+ciftiTools::write_cifti(cii_induction, here('output', 'induction_specific_map.dlabel.nii'))
+ciftiTools::write_cifti(cii_deduction, here('output', 'deduction_specific_map.dlabel.nii'))
+ciftiTools::write_cifti(cii_conjunction, here('output', 'conjunction_map.dlabel.nii'))
+
+```
+
+
+## Classifier 
+
+```{r classifier}
+int.brain <- llk.points <- vector("list", n.samples)
+int_names <- c("intercept.iL", "intercept.iR", "intercept.dL", "intercept.dR")
+sp_names <- c("sf.iL", "sf.iR", "sf.dL", "sf.dR")
+
+for (n in seq_len(n.samples)) {
+  smpl.latent <- samples[[n]]$latent
+
+  intercepts <- map(int_names, ~ smpl.latent[startsWith(rownames(smpl.latent), .), ])
+  sps <- map(sp_names, ~ smpl.latent[startsWith(rownames(smpl.latent), .), ])
+
+  int.brain[[n]] <- map2(sps, intercepts, ~ sum(iw * exp(.x + .y)))
+  llk.points[[n]] <- pmap(list(As, sps, intercepts), function(x, y, z) {
+    (as.vector(x %*% y) + z)[coords$vertices]
+  })
+}
+
+int.brain <- int.brain %>%
+  transpose() %>%
+  map(unlist) %>%
+  bind_cols %>%
+  as.matrix()
+
+llk.points <- transpose(llk.points)
+
+
+# judge for each paper (74 papers)
+map_indicator <- data %>% unnest(cols = data) %>% pluck("row_num")
+
+classifier <- data %>%
+  mutate(llks = pmap(., function(hemisphere, data, row_num, ...) {
+    map_dfr(seq_len(n.samples), function(n) {
+      if (hemisphere == "left") {
+        mu <- 4 * pi - c(int.brain[n, 1], int.brain[n, 3])
+        log_sum_lambda <- c(sum(llk.points[[1]][[n]][map_indicator == row_num]), sum(llk.points[[3]][[n]][map_indicator == row_num]))
+      } else {
+        mu <- 4 * pi - c(int.brain[n, 2], int.brain[n, 4])
+        log_sum_lambda <- c(sum(llk.points[[2]][[n]][map_indicator == row_num]), sum(llk.points[[4]][[n]][map_indicator == row_num]))
+      }
+      res <- exp(mu + log_sum_lambda)
+      tibble(inductive = res[1], deductive = res[2])
+    })
+  }))
+
+classifier <- classifier %>%
+  mutate(sum_llks = map(llks, summarise_all, sum)) %>%
+  unnest(cols = sum_llks) %>%
+  group_by(Paper, inference) %>%
+  summarise(
+    sum_ind = sum(inductive),
+    sum_ded = sum(deductive)
+  ) %>%
+  ungroup() %>%
+  mutate(sum_ind = sum_ind / n.samples,
+         sum_ded = sum_ded / n.samples,
+         classification = if_else(sum_ind > sum_ded, 1, 2))
+
+# final accuracy
+summary_classifier <- classifier %>%
+  mutate(correct = if_else(inference == classification, "correct", "incorrect")) %>%
+  group_by(inference) %>%
+  count(correct) %>%
+  ungroup() %>%
+  pivot_wider(names_from = correct,
+              values_from = n) %>%
+  mutate(prop_correct = correct / (correct + incorrect),
+         prop_incorrect = 1 - prop_correct,
+         balanced_acc = sum(prop_correct) / 2,
+         overall_acc = sum(correct) / sum(correct + incorrect))
+
+```
+
+### Classification accuracy
+
+```{r classification_acc}
+# confusion matrix
+summary_classifier <- as.data.frame(summary_classifier)
+rownames(summary_classifier) <- c('Induction', 'Deduction')
+summary_classifier %>%
+  transmute(prop_correct = prop_correct * 100, 
+            prop_incorrect = prop_incorrect * 100) %>%
+  knitr::kable(digits = 2,
+               row.names = TRUE,
+               col.names = c('Correct (%)', 'Incorrect (%)'))
+```
+
+
+## System Information
+
+```{r sys_info}
+sessionInfo()
+```
+

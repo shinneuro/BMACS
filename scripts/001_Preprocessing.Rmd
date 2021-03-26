@@ -1,0 +1,84 @@
+---
+title: "Preprocessing"
+author: "Minho Shin"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r library, message=FALSE, results=FALSE}
+library(here)
+library(tidyverse)
+# custom functions
+source_files <- list.files(here("R"), full.names = TRUE)
+lapply(source_files, source)
+matlabpath <- '/Applications/MATLAB_R2020a.app/bin/matlab'
+fshome <- '/Applications/freesurfer/7.1.1'
+```
+
+## Tidy raw data
+
+```{r tidy_data}
+data <- read_csv(here("data", "data_coords_raw.csv"))
+
+# include maximal information
+data <- data %>%
+  # first rename some columns
+  rename(
+    year = Year,
+    inference = Inference,
+    subject = Subject,
+    modality = `Stimuli Modality`,
+    software = Software,
+    correction = Correction,
+    linguisticity = Linguisticity,
+    contrast = `Contrasts Included`,
+    simple = `Simplified Contrasts`,
+    location = `Location (BA)`,
+    scanner = `Scanning Method`,
+    design = `Design`
+  ) %>%
+  mutate(
+    inference = case_when(
+      grepl("^Inductive*", simple) ~ 1,
+      grepl("^Deductive*", simple) ~ 2
+    ),
+    inf_name = recode_factor(inference, `1` = "Inductive", `2` = "Deductive"),
+    contrasts = case_when(
+      str_detect(simple, "Baseline|Other") ~ "Baseline",
+      str_detect(simple, "^(Deductive|Inductive)$") ~ "No_Contrast",
+      str_detect(simple, "Linear") ~ "Linear",
+      str_detect(simple, "Interaction") ~ "Interaction",
+      str_detect(simple, "(Deductive-Inductive|Inductive-Deductive)") ~ "Cross_Inference",
+      str_detect(simple, "(Deductive-Deductive|Inductive-Inductive)") ~ "Within_Inference"
+    )
+  )
+
+
+```
+
+## Convert MNI coordinates to fsaverage sphere coordinates
+
+
+```{r conversion, message=FALSE}
+mni_coords <- select(data, mni_x:mni_z)
+fsavg_coords <- convert_mni_to_fsavg(mni_coords, 'sphere', matlabpath, fshome)
+
+# add fsaverage data
+# remove coordinates that failed conversion
+# remove study 59 and 65
+data <- cbind(data,fsavg_coords) %>% arrange(Paper, contrast) %>%
+  mutate(hemisphere = if_else(hemisphere == 0, "left", "right")) %>%
+  filter(!is.nan(vertices)) %>%
+  filter(! Paper %in% c(59, 65))
+
+paper.numbers <- count(data, Paper)
+data$Paper <- rep(seq_len(nrow(paper.numbers)) , paper.numbers$n)
+study.numbers <- count(data, Paper, contrast, inference)
+data$study <- rep(seq_len(nrow(study.numbers)) , study.numbers$n)
+
+
+write_csv(data, here("data", "data_coords_preprocessed.csv"))
+```

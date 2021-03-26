@@ -1,0 +1,5 @@
+                      Key      Red     Green     Blue Alpha
+???                     0 1.000000 1.0000000 1.000000     0
+Inductive_Exceed_0.95   1 0.843137 0.0980392 0.109804     1
+Conjunction_Prob_0.95   2 0.192157 0.6392157 0.329412     1
+Deductive_Exceed_0.95   3 0.172549 0.4823530 0.713726     1
